@@ -36,6 +36,7 @@ import watermarked
 import media_auth
 import remote_worker
 import yt_account
+import live_sessions
 from jsonfile import write_json_atomic
 
 load_dotenv()
@@ -4090,9 +4091,15 @@ async def lifespan(app: FastAPI):
         _geoip.start(OUTPUT_DIR, wanted=lambda: bool(_queue_mode.slow_countries())
                      and not _queue_mode.killed())
     yield
-    # Cleanup (optional: cancel worker)
+    # A live session owns recorder subprocesses; leaving them behind on a
+    # redeploy would keep pulling the stream into a directory nobody reads.
+    await live_sessions.shutdown()
 
 app = FastAPI(lifespan=lifespan)
+
+# Live sessions submit each window through this same app in-process, exactly
+# like cloud/autopilot; hand it the object now that it exists.
+live_sessions.configure(app)
 
 # Cloud mode: attach middleware + routers at import time (before the app serves).
 if BILLING_ENABLED:
@@ -5942,6 +5949,142 @@ def _presented_status(job_id, job):
         # finished for the user until the delivery says so.
         return 'processing'
     return job['status']
+
+
+# --------------------------------------------------------------------------- #
+# Live sessions: clip an ongoing broadcast, window by window
+# --------------------------------------------------------------------------- #
+# Length of each recorded window: a full 1-minute source per job, so the usual
+# 15-60 s clip fits with a little context on each side.
+LIVE_WINDOW_SECONDS = int(os.environ.get("LIVE_WINDOW_SECONDS", "60"))
+# How many live sessions one account may run at once (each owns a recorder and
+# feeds the queue continuously, so this is a budget guard, not a nicety).
+LIVE_MAX_SESSIONS = int(os.environ.get("LIVE_MAX_SESSIONS", "3"))
+
+
+def _live_work_root():
+    return os.path.join(OUTPUT_DIR, "live")
+
+
+def _live_view(session):
+    """A session's state plus every clip its finished windows produced, so the
+    dashboard needs one poll instead of one per job."""
+    view = session.view()
+    clips, jobs_view = [], []
+    for jid in session.job_ids:
+        job = jobs.get(jid) or _job_view_from_disk(jid)
+        status = _presented_status(jid, job) if job else "gone"
+        jobs_view.append({"job_id": jid, "status": status})
+        if job and isinstance(job.get("result"), dict):
+            clips.extend(job["result"].get("clips") or [])
+    view["jobs_detail"] = jobs_view
+    view["clips"] = _with_download_urls({"clips": clips})["clips"] if clips else []
+    return view
+
+
+@app.post("/api/live/start")
+async def live_start(
+    request: Request,
+    url: Optional[str] = Form(None),
+    acknowledged: Optional[str] = Form(None),
+    window_seconds: Optional[str] = Form(None),
+):
+    """Start recording a live broadcast and clipping it window by window.
+
+    The stream is captured continuously; every closed ~window_seconds window is
+    handed to the normal pipeline as its own job, so its clips appear while the
+    broadcast is still running. Stopped only by the caller (POST
+    /api/live/{id}/stop) or when the broadcast ends.
+    """
+    if "application/json" in request.headers.get("content-type", ""):
+        body = await request.json()
+        url = body.get("url") or url
+        if body.get("acknowledged") is not None:
+            acknowledged = body.get("acknowledged")
+        window_seconds = body.get("window_seconds") or window_seconds
+
+    if not url:
+        raise HTTPException(status_code=400, detail="Paste the link of a live broadcast.")
+    if str(acknowledged).lower() not in ("1", "true", "yes"):
+        raise HTTPException(status_code=400,
+                            detail="You must confirm you own the content or have rights to process it.")
+    if DISABLE_YOUTUBE_URL:
+        raise HTTPException(status_code=403,
+                            detail="YouTube URL ingest is disabled on this deployment.")
+
+    # Same gate as /api/process: without a key (or a local model) the pipeline
+    # would accept the source and then fail on every window.
+    api_key = await resolve_gemini(request)
+    if not api_key and not (llm_backend.active() and not BILLING_ENABLED):
+        raise gemini_missing_error()
+
+    # Refuse a URL no server-side fetch may touch before yt-dlp ever sees it.
+    await _validate_source_url(url)
+
+    window = LIVE_WINDOW_SECONDS
+    if window_seconds not in (None, ""):
+        try:
+            window = int(float(window_seconds))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="window_seconds must be a number")
+
+    owner = await _owner_id(request)
+    running = [s for s in live_sessions.list_sessions(owner)
+               if s.status in ("starting", "recording")]
+    if len(running) >= LIVE_MAX_SESSIONS:
+        raise HTTPException(status_code=429,
+                            detail="You already have the maximum number of live sessions running.")
+
+    # Replay the caller's identity on every window submission, so the jobs
+    # belong to the same user in cloud mode (self-host needs none). The BYOK
+    # Gemini key must ride along too, or every window would be refused for the
+    # same reason the start call would have been.
+    headers = {}
+    if request.headers.get("authorization"):
+        headers["Authorization"] = request.headers["authorization"]
+    if request.headers.get("cookie"):
+        headers["Cookie"] = request.headers["cookie"]
+    if request.headers.get("x-gemini-key"):
+        headers["X-Gemini-Key"] = request.headers["x-gemini-key"]
+
+    try:
+        session = await live_sessions.start_session(
+            url, work_root=_live_work_root(), window_seconds=window,
+            headers=headers, owner=owner)
+    except HTTPException:
+        raise
+    except ValueError as e:
+        # NotASingleVideo / NotLive / a yt-dlp read failure: all a bad link.
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not start the live session: {e}")
+    return _live_view(session)
+
+
+@app.get("/api/live")
+async def live_list(request: Request):
+    """The caller's live sessions, newest first."""
+    owner = await _owner_id(request)
+    return {"sessions": [s.view() for s in live_sessions.list_sessions(owner)]}
+
+
+@app.get("/api/live/{session_id}")
+async def live_status(session_id: str, request: Request):
+    session = live_sessions.get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Live session not found")
+    await _assert_job_owner(request, {"user_id": session.owner})
+    return _live_view(session)
+
+
+@app.post("/api/live/{session_id}/stop")
+async def live_stop(session_id: str, request: Request):
+    session = live_sessions.get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Live session not found")
+    await _assert_job_owner(request, {"user_id": session.owner})
+    await live_sessions.stop_session(session_id)
+    return _live_view(session)
 
 
 @app.get("/api/status/{job_id}")
@@ -8240,6 +8383,9 @@ async def post_to_socials(req: SocialPostRequest, request: Request):
              data_payload["youtube_description"] = final_description
              data_payload["privacyStatus"] = "public"
 
+        if "facebook" in req.platforms:
+             data_payload["facebook_title"] = final_description
+
         # The upload is a blocking multipart POST of the whole clip (tens of
         # seconds for TikTok+YouTube). Run inline, it froze the event loop:
         # 23-sep-2026 19:47:48 UTC one post stalled every request, /health
@@ -8323,7 +8469,7 @@ def _log_post_failures(request_id, status, results):
         print(f"[social-post-failed] request={request_id} platform={r.get('platform')} "
               f"status={status} message={msg!r}")
 
-SOCIAL_PLATFORMS = ("tiktok", "instagram", "youtube")
+SOCIAL_PLATFORMS = ("tiktok", "instagram", "youtube", "facebook")
 
 
 async def _managed_social_user(request, api_key, profile):
@@ -8392,7 +8538,7 @@ async def get_social_user(request: Request):
                              socials = p.get('social_accounts', {})
                              connected = []
                              # Check typical platforms
-                             for platform in ['tiktok', 'instagram', 'youtube']:
+                             for platform in ['tiktok', 'instagram', 'youtube', 'facebook']:
                                  account_info = socials.get(platform)
                                  # If it's a dict and typically has data, or just not empty string
                                  if isinstance(account_info, dict):
@@ -9748,6 +9894,8 @@ async def saasshorts_post_to_socials(req: SaaSPostRequest, request: Request):
             data_payload["youtube_title"] = youtube_title(final_title)
             data_payload["youtube_description"] = final_description
             data_payload["privacyStatus"] = "public"
+        if "facebook" in req.platforms:
+            data_payload["facebook_title"] = final_description
 
         filename = os.path.basename(file_path)
         print(f"📡 [AI Shorts] Sending to Upload-Post: {req.platforms}")
