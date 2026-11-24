@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Download, Share2, Instagram, Youtube, Video, AlertCircle, Loader2, Copy, Check, Wand2, Type, Calendar, Languages, FileText, Link2, Scissors, Crosshair, TrendingUp } from 'lucide-react';
+import { Download, Share2, Instagram, Youtube, Video, Facebook, AlertCircle, Loader2, Copy, Check, Wand2, Type, Calendar, Languages, FileText, Link2, Scissors, Crosshair, TrendingUp } from 'lucide-react';
 import { getApiUrl } from '../config';
 import { apiFetch } from '../lib/api';
 import { track } from '../lib/analytics';
@@ -45,6 +45,7 @@ const PLATFORM_OPTIONS = [
     { value: 'tiktok', label: 'tiktok', icon: <Video size={16} /> },
     { value: 'instagram', label: 'instagram', icon: <Instagram size={16} /> },
     { value: 'youtube', label: 'youtube', icon: <Youtube size={16} /> },
+    { value: 'facebook', label: 'facebook', icon: <Facebook size={16} /> },
 ];
 
 function clipDurationSeconds(clip) {
@@ -310,6 +311,7 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                     tiktok: connectedPlatforms.includes('tiktok'),
                     instagram: connectedPlatforms.includes('instagram'),
                     youtube: connectedPlatforms.includes('youtube'),
+                    facebook: connectedPlatforms.includes('facebook'),
                 });
             }
         }
@@ -1181,13 +1183,14 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                         <label className="eyebrow block mb-2">PLATFORMS</label>
                         <SegmentedControl
                             multi
-                            columns={3}
+                            columns={2}
                             options={platformOptions}
                             value={Object.keys(platforms).filter(k => platforms[k])}
                             onChange={(arr) => setPlatforms({
                                 tiktok: arr.includes('tiktok'),
                                 instagram: arr.includes('instagram'),
                                 youtube: arr.includes('youtube'),
+                                facebook: arr.includes('facebook'),
                             })}
                         />
                     </div>

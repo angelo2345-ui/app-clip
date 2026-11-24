@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { Upload, Sparkles, Youtube, Instagram, Share2, ChevronDown, Check, Activity, LayoutDashboard, Settings, Plus, History, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2, Mail, Loader2, Download, Menu, Lock, Rocket } from 'lucide-react';
+import { Upload, Sparkles, Youtube, Instagram, Share2, ChevronDown, Check, Activity, LayoutDashboard, Settings, Plus, History, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2, Mail, Loader2, Download, Menu, Lock, Rocket, Facebook } from 'lucide-react';
 import KeyInput from './components/KeyInput';
 import MediaInput from './components/MediaInput';
+import LivePanel from './components/LivePanel';
 import McpConnectCard from './components/McpConnectCard';
 import ResultCard from './components/ResultCard';
 import ProcessingAnimation from './components/ProcessingAnimation';
@@ -152,6 +153,9 @@ const ProfileNetworkIcons = ({ profile, size = 12 }) => (
     </span>
     <span className={profile?.connected?.includes('youtube') ? 'text-ink' : 'text-muted opacity-40'}>
       <Youtube size={size} />
+    </span>
+    <span className={profile?.connected?.includes('facebook') ? 'text-ink' : 'text-muted opacity-40'}>
+      <Facebook size={size} />
     </span>
   </span>
 );
@@ -390,6 +394,12 @@ function App() {
   });
   const [processingMedia, setProcessingMedia] = useState(null);
   const [activeTab, setActiveTab] = useState('dashboard'); // dashboard, settings
+  // Live mode: the id of the broadcast session being clipped, or null while the
+  // generator is showing. `liveStarting` drives the button spinner; `liveError`
+  // carries the server's own reason for a refused link.
+  const [liveSessionId, setLiveSessionId] = useState(null);
+  const [liveStarting, setLiveStarting] = useState(false);
+  const [liveError, setLiveError] = useState('');
   // Mobile only: the full nav lives in a drawer behind the header's menu button.
   const [navOpen, setNavOpen] = useState(false);
   // Reopened-project state (paid mode): per-clip {index, server_file, active_layers}
@@ -1300,6 +1310,41 @@ function App() {
     }
   };
 
+  // Start clipping a running broadcast. Same pre-flight gates as handleProcess
+  // (signed in + entitled in cloud, keys in self-host), then the server holds
+  // the stream and every ~60s window becomes its own job. Unlike a normal job
+  // there is nothing to poll here: the session view (LivePanel) does that.
+  const handleStartLive = async ({ url }) => {
+    if (billingEnabled) {
+      if (!isSignedIn) { setShowLogin(true); return; }
+      if (!isManaged) { window.location.hash = '#/pricing'; return; }
+    } else if (keysMissing) {
+      setShowKeyModal(true);
+      return;
+    }
+    setLiveError('');
+    setLiveStarting(true);
+    try {
+      const headers = apiKey ? { 'X-Gemini-Key': apiKey } : {};
+      const body = new FormData();
+      body.append('url', url);
+      body.append('acknowledged', 'true');
+      const res = await apiFetch('/api/live/start', { method: 'POST', headers, body });
+      if (!res.ok) {
+        let detail = await res.text();
+        try { detail = JSON.parse(detail).detail || detail; } catch { /* not JSON */ }
+        throw new Error(detail);
+      }
+      const data = await res.json();
+      setLiveSessionId(data.id);
+      track('LiveSessionStarted');
+    } catch (e) {
+      setLiveError(readableError(e.message));
+    } finally {
+      setLiveStarting(false);
+    }
+  };
+
   // Resume the job the visitor started before signing in. Runs on the render
   // that first sees isSignedIn true — after a magic link or a Google round trip,
   // i.e. a fresh document — and replays the request through handleProcess, so
@@ -1790,6 +1835,16 @@ function App() {
                 <>
               <KeyInput onKeySet={setApiKey} savedKey={apiKey} />
 
+              <KeyInput
+                onKeySet={(k) => setUploadPostKey(k.trim().replace(/^Apikey\s+/i, ''))}
+                savedKey={uploadPostKey}
+                title="Upload-Post API Key"
+                placeholder="Pega tu clave de upload-post.com"
+                helpText="Publica tus clips en TikTok, YouTube e Instagram. La clave se guarda solo en tu navegador."
+                helpLink="https://www.upload-post.com"
+                helpLinkText="Consigue tu clave de Upload-Post →"
+              />
+
 
 
                 </>
@@ -2108,7 +2163,19 @@ function App() {
           )} */}
 
           {/* View: Dashboard (Idle) */}
-          {activeTab === 'dashboard' && status === 'idle' && (
+          {activeTab === 'dashboard' && status === 'idle' && liveSessionId && (
+            <div className="h-full overflow-y-auto custom-scrollbar animate-fade">
+              <div className="max-w-6xl mx-auto p-4 sm:p-6 md:p-8">
+                <LivePanel
+                  sessionId={liveSessionId}
+                  onClose={() => { setLiveSessionId(null); setLiveError(''); }}
+                  onOpenProject={restoreProject}
+                />
+              </div>
+            </div>
+          )}
+
+          {activeTab === 'dashboard' && status === 'idle' && !liveSessionId && (
             <div className="h-full overflow-y-auto custom-scrollbar animate-fade">
               <div className="min-h-full flex flex-col items-center justify-center px-4 py-5 sm:p-6">
               {/* On a phone the hero used to fill the fold on its own and push
@@ -2139,7 +2206,15 @@ function App() {
                   )}
                 </div>
 
-                <MediaInput onProcess={handleProcess} isProcessing={status === 'processing'} />
+                {liveError && (
+                  <p className="text-danger text-sm -mb-2" role="alert">{liveError}</p>
+                )}
+
+                <MediaInput
+                  onProcess={handleProcess}
+                  onStartLive={handleStartLive}
+                  isProcessing={status === 'processing' || liveStarting}
+                />
 
                 <div className="flex flex-wrap items-center justify-center gap-4 sm:gap-8 text-muted text-xs sm:text-sm">
                   <span className="flex items-center gap-2"><Youtube size={16} /> YouTube</span>

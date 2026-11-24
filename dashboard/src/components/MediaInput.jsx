@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Link2, Upload, FileVideo, X, Info, Loader2, ChevronDown } from 'lucide-react';
+import { Link2, Upload, FileVideo, X, Info, Loader2, ChevronDown, Radio } from 'lucide-react';
 import { track } from '../lib/analytics';
 import { getApiUrl } from '../config';
 import SourceCost from './SourceCost';
@@ -30,11 +30,14 @@ const readVideoDuration = (file) => new Promise((resolve) => {
     } catch { resolve(null); }
 });
 
-export default function MediaInput({ onProcess, isProcessing }) {
+export default function MediaInput({ onProcess, onStartLive, isProcessing }) {
     const [youtubeUrlEnabled, setYoutubeUrlEnabled] = useState(true);
     // File upload is the primary path; the link is secondary.
-    const [mode, setMode] = useState('file'); // 'file' | 'url'
+    const [mode, setMode] = useState('file'); // 'file' | 'url' | 'live'
     const [url, setUrl] = useState('');
+    // A running broadcast: kept apart from the VOD link so switching tabs never
+    // carries one over the other.
+    const [liveUrl, setLiveUrl] = useState('');
     const [file, setFile] = useState(null);
     const [fileSeconds, setFileSeconds] = useState(null);
     const fileTooShort = fileSeconds != null && fileSeconds < MIN_SOURCE_SECONDS;
@@ -135,6 +138,14 @@ export default function MediaInput({ onProcess, isProcessing }) {
             localStorage.setItem('os_auto_hook_style_v2', autoHookStyle);
             localStorage.setItem('os_layout', layout);
         } catch { /* ignore */ }
+        if (mode === 'live') {
+            // A live session is its own thing: the link is validated as a
+            // running broadcast and the server records it window by window.
+            // No output-format/advanced knobs travel — every window runs the
+            // pipeline defaults.
+            if (liveUrl) onStartLive({ url: liveUrl });
+            return;
+        }
         if (mode === 'url' && url) {
             onProcess({ type: 'url', payload: url, acknowledged: true, outputFormat, ...advanced });
         } else if (mode === 'file' && file && !fileTooShort) {
@@ -175,10 +186,43 @@ export default function MediaInput({ onProcess, isProcessing }) {
                         Video URL
                     </button>
                 )}
+                {youtubeUrlEnabled && onStartLive && (
+                    <button
+                        onClick={() => setMode('live')}
+                        className={`flex items-center gap-2 pb-3 px-1 -mb-px border-b-2 text-sm lowercase whitespace-nowrap transition-colors ${mode === 'live'
+                            ? 'text-ink border-brass'
+                            : 'text-muted border-transparent hover:text-ink2'
+                            }`}
+                    >
+                        <Radio size={16} className={`hidden sm:block ${mode === 'live' ? 'text-brass' : ''}`} />
+                        Live
+                    </button>
+                )}
             </div>
 
             <form onSubmit={handleSubmit}>
-                {mode === 'url' ? (
+                {mode === 'live' ? (
+                    <div className="space-y-4" data-tutorial="drop-zone">
+                        <div className="relative">
+                            <input
+                                type="url"
+                                value={liveUrl}
+                                onChange={(e) => setLiveUrl(e.target.value)}
+                                placeholder="https://youtube.com/live/... paste a live link"
+                                className="input-field"
+                                required
+                            />
+                        </div>
+                        <p className="text-xs text-muted leading-relaxed flex items-start gap-2">
+                            <Radio size={14} className="mt-0.5 shrink-0 text-brass" />
+                            <span>
+                                Paste the link of a broadcast that is <b className="text-ink2">live right now</b>. We record it in
+                                ~60s windows and clip each one the moment it closes, so clips show up while the stream is
+                                still running. You stop the session yourself whenever you want.
+                            </span>
+                        </p>
+                    </div>
+                ) : mode === 'url' ? (
                     <div className="space-y-4" data-tutorial="drop-zone">
                         <div className="relative">
                             <input
@@ -259,15 +303,19 @@ export default function MediaInput({ onProcess, isProcessing }) {
                     </div>
                 )}
 
-                <SourceCost
-                    mode={mode}
-                    url={url}
-                    fileSeconds={fileSeconds}
-                    range={range}
-                    onRangeChange={setRange}
-                />
+                {mode !== 'live' && (
+                    <SourceCost
+                        mode={mode}
+                        url={url}
+                        fileSeconds={fileSeconds}
+                        range={range}
+                        onRangeChange={setRange}
+                    />
+                )}
 
-                {/* Output format selector */}
+                {/* Output format selector — a live window is always rendered the
+                    same way (9:16 shorts), so the choice does not apply. */}
+                {mode !== 'live' && (
                 <div className="mt-5" data-tutorial="output-format">
                     <p className="eyebrow mb-2">Output format</p>
                     <div className="grid grid-cols-3 gap-2">
@@ -302,8 +350,10 @@ export default function MediaInput({ onProcess, isProcessing }) {
                         })}
                     </div>
                 </div>
+                )}
 
                 {/* Advanced generation controls — collapsed by default; blank = AI decides */}
+                {mode !== 'live' && (
                 <div className="mt-4">
                     <button
                         type="button"
@@ -403,6 +453,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
                         </div>
                     )}
                 </div>
+                )}
 
                 <label className="flex items-start gap-2.5 mt-5 text-left text-[13px] sm:text-xs leading-relaxed text-muted cursor-pointer select-none">
                     <input
@@ -419,13 +470,21 @@ export default function MediaInput({ onProcess, isProcessing }) {
                 <button
                     type="submit"
                     data-tutorial="generate"
-                    disabled={isProcessing || !acknowledged || (mode === 'url' && !url) || (mode === 'file' && (!file || fileTooShort))}
+                    disabled={isProcessing || !acknowledged
+                        || (mode === 'url' && !url)
+                        || (mode === 'file' && (!file || fileTooShort))
+                        || (mode === 'live' && !liveUrl)}
                     className="w-full btn-primary mt-4"
                 >
                     {isProcessing ? (
                         <>
                             <Loader2 size={16} className="animate-spin" />
                             Processing Video...
+                        </>
+                    ) : mode === 'live' ? (
+                        <>
+                            <Radio size={16} />
+                            Start Live Clipping
                         </>
                     ) : (
                         <>
