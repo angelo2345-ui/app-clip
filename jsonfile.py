@@ -35,7 +35,14 @@ def write_json_atomic(path, data, **dump_kwargs):
             mode = os.stat(path).st_mode & 0o777
         except FileNotFoundError:
             mode = 0o644
-        os.chmod(tmp, mode)
+        try:
+            os.chmod(tmp, mode)
+        except OSError:
+            # Hay sistemas de archivos que no lo permiten: los discos de
+            # Windows montados en WSL (sin la opción `metadata`) muestran todo
+            # como propiedad de root, y el proceso corre sin privilegios. El
+            # modo es cosmético aquí, así que seguimos con el 0600 de mkstemp.
+            pass
         os.replace(tmp, path)
     except BaseException:
         try:
